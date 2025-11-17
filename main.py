@@ -3,9 +3,15 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timezone
 
 from database import db, create_document, get_documents
+
+# Optional dependency for RSS parsing
+try:
+    import feedparser  # type: ignore
+except Exception:  # pragma: no cover
+    feedparser = None
 
 app = FastAPI(title="CRE8 API", version="0.1.0")
 
@@ -88,7 +94,14 @@ def list_podcasts(
         ]
     items = get_documents("podcastepisode", query) if db else []
     # Sort newest first if field present
-    items.sort(key=lambda x: x.get("published_at", datetime.min), reverse=True)
+    def _dt(v):
+        if isinstance(v, datetime):
+            return v
+        try:
+            return datetime.fromisoformat(v)
+        except Exception:
+            return datetime.min
+    items.sort(key=lambda x: _dt(x.get("published_at", datetime.min)), reverse=True)
     return {"total": len(items), "items": items}
 
 @app.get("/podcasts/{slug}")
@@ -97,6 +110,92 @@ def get_podcast_by_slug(slug: str):
     if not items:
         raise HTTPException(status_code=404, detail="Episode not found")
     return items[0]
+
+# Import from Transistor RSS
+class ImportRequest(BaseModel):
+    feed_url: Optional[str] = None
+
+
+def _slugify(text: str) -> str:
+    import re
+    text = (text or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    text = re.sub(r"-+", "-", text).strip("-")
+    return text or "episode"
+
+
+@app.post("/podcasts/import/transistor")
+def import_transistor(req: ImportRequest):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    if feedparser is None:
+        raise HTTPException(status_code=500, detail="RSS parser not available. Install feedparser.")
+
+    # Default Transistor feed pattern for a show hosted at https://creconnection.transistor.fm/
+    default_feed = "https://feeds.transistor.fm/creconnection"
+    feed_url = req.feed_url or os.getenv("TRANSISTOR_FEED_URL") or default_feed
+
+    parsed = feedparser.parse(feed_url)
+    if getattr(parsed, "bozo", 0):
+        raise HTTPException(status_code=400, detail=f"Failed to parse feed: {getattr(parsed, 'bozo_exception', 'Unknown')}")
+
+    created = 0
+    updated = 0
+    for entry in parsed.entries:
+        title = entry.get("title", "Untitled")
+        link = entry.get("link")
+        guid = entry.get("id") or entry.get("guid") or link or title
+        slug = _slugify(guid)[:80]
+        if not slug:
+            slug = _slugify(title)[:80]
+        # Find audio enclosure
+        audio_url = None
+        for en in entry.get("enclosures", []) or []:
+            if en.get("type", "").startswith("audio"):
+                audio_url = en.get("href") or en.get("url")
+                break
+        if not audio_url:
+            # Some feeds use links in the summary
+            audio_url = entry.get("audio") or entry.get("media_content", [{}])[0].get("url") if entry.get("media_content") else None
+        # Published date
+        pub = None
+        if entry.get("published_parsed"):
+            try:
+                pub = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+            except Exception:
+                pub = None
+        elif entry.get("updated_parsed"):
+            try:
+                pub = datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc)
+            except Exception:
+                pub = None
+        summary = entry.get("summary") or entry.get("subtitle") or ""
+        author = entry.get("author") or (entry.get("authors", [{}])[0].get("name") if entry.get("authors") else None)
+        tags = [t.get("term") for t in (entry.get("tags") or []) if t.get("term")]
+
+        # Upsert behavior based on slug
+        existing = list(db["podcastepisode"].find({"slug": slug}))
+        payload = {
+            "title": title,
+            "slug": slug,
+            "summary": summary,
+            "audio_url": audio_url,
+            "guest_name": author,
+            "pillars": [],
+            "tags": tags,
+            "published_at": pub or datetime.now(timezone.utc),
+            "external_url": link,
+            "source": "transistor"
+        }
+        if existing:
+            db["podcastepisode"].update_one({"_id": existing[0]["_id"]}, {"$set": payload, "$setOnInsert": {"created_at": datetime.now(timezone.utc)}, "$currentDate": {"updated_at": True}})
+            updated += 1
+        else:
+            create_document("podcastepisode", payload)
+            created += 1
+
+    total = db["podcastepisode"].count_documents({}) if db else 0
+    return {"status": "ok", "created": created, "updated": updated, "total": total, "feed": feed_url}
 
 # Resources
 @app.get("/resources", response_model=Paginated)
@@ -181,13 +280,20 @@ def list_directory(
 def list_events(upcoming: Optional[bool] = None):
     items = get_documents("event") if db else []
     # sort by date desc
-    items.sort(key=lambda x: x.get("date", datetime.min), reverse=True)
+    def _dt(v):
+        if isinstance(v, datetime):
+            return v
+        try:
+            return datetime.fromisoformat(v)
+        except Exception:
+            return datetime.min
+    items.sort(key=lambda x: _dt(x.get("date", datetime.min)), reverse=True)
     if upcoming is not None:
         now = datetime.utcnow()
         if upcoming:
-            items = [e for e in items if e.get("date") and e["date"] >= now]
+            items = [e for e in items if e.get("date") and _dt(e["date"]) >= now]
         else:
-            items = [e for e in items if e.get("date") and e["date"] < now]
+            items = [e for e in items if e.get("date") and _dt(e["date"]) < now]
     return {"total": len(items), "items": items}
 
 # Seed minimal data for demo
@@ -215,7 +321,7 @@ def seed():
             "guest_name": "Alex Morgan",
             "pillars": ["community", "capital"],
             "tags": ["networking", "ecosystem"],
-            "published_at": datetime.utcnow(),
+            "published_at": datetime.now(timezone.utc),
             "audio_url": "https://cdn.simplecast.com/audio.mp3"
         })
         created["episodes"] += 1
@@ -263,7 +369,7 @@ def seed():
         create_document("event", {
             "title": "CRE8 Summit 2025",
             "slug": "cre8-summit-2025",
-            "date": datetime.utcnow(),
+            "date": datetime.now(timezone.utc),
             "location": "Austin, TX",
             "summary": "A gathering of dealmakers and innovators.",
             "rsvp_url": "https://example.com/rsvp"

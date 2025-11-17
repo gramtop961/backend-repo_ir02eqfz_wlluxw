@@ -1,5 +1,6 @@
 import os
-from typing import List, Optional
+import logging
+from typing import Optional, Any, Dict
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -18,6 +19,10 @@ try:
     import requests  # type: ignore
 except Exception:  # pragma: no cover
     requests = None
+
+# Logger setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("cre8")
 
 app = FastAPI(title="CRE8 API", version="0.1.0")
 
@@ -65,16 +70,25 @@ def test_database():
         response["database"] = f"❌ Error: {str(e)[:120]}"
     return response
 
-# ------------ CRE8 Domain Endpoints -------------
-# Simple response models
+# ------------ Helpers -------------
 class Paginated(BaseModel):
     total: int
     items: list
 
+def _public(doc: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(doc, dict):
+        return doc
+    d = dict(doc)
+    if d.get("_id") is not None:
+        d["_id"] = str(d["_id"])
+    return d
+
+# ------------ CRE8 Domain Endpoints -------------
 # Principles
 @app.get("/principles", response_model=Paginated)
 def list_principles():
-    items = get_documents("principle") if db else []
+    items = get_documents("principle") if db is not None else []
+    items = [_public(i) for i in items]
     return {"total": len(items), "items": items}
 
 # Podcasts
@@ -98,7 +112,7 @@ def list_podcasts(
             {"summary": {"$regex": q, "$options": "i"}},
             {"guest_name": {"$regex": q, "$options": "i"}},
         ]
-    items = get_documents("podcastepisode", query) if db else []
+    items = get_documents("podcastepisode", query) if db is not None else []
     # Sort newest first if field present
     def _dt(v):
         if isinstance(v, datetime):
@@ -108,14 +122,15 @@ def list_podcasts(
         except Exception:
             return datetime.min
     items.sort(key=lambda x: _dt(x.get("published_at", datetime.min)), reverse=True)
+    items = [_public(i) for i in items]
     return {"total": len(items), "items": items}
 
 @app.get("/podcasts/{slug}")
 def get_podcast_by_slug(slug: str):
-    items = get_documents("podcastepisode", {"slug": slug}) if db else []
+    items = get_documents("podcastepisode", {"slug": slug}) if db is not None else []
     if not items:
         raise HTTPException(status_code=404, detail="Episode not found")
-    return items[0]
+    return _public(items[0])
 
 # Import from Transistor RSS
 class ImportRequest(BaseModel):
@@ -148,78 +163,87 @@ def _fetch_feed_content(url: str) -> bytes:
 
 @app.post("/podcasts/import/transistor")
 def import_transistor(req: ImportRequest):
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database not configured")
-    if feedparser is None:
-        raise HTTPException(status_code=500, detail="RSS parser not available. Install feedparser.")
+    try:
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database not configured")
+        if feedparser is None:
+            raise HTTPException(status_code=500, detail="RSS parser not available. Install feedparser.")
 
-    # Default Transistor feed pattern for a show hosted at https://creconnection.transistor.fm/
-    default_feed = "https://feeds.transistor.fm/creconnection"
-    feed_url = req.feed_url or os.getenv("TRANSISTOR_FEED_URL") or default_feed
+        # Default Transistor feed pattern (can be overridden via request or env)
+        default_feed = "https://feeds.transistor.fm/creconnection"
+        feed_url = req.feed_url or os.getenv("TRANSISTOR_FEED_URL") or default_feed
 
-    # Fetch with headers to avoid 403/HTML responses
-    content = _fetch_feed_content(feed_url)
-    parsed = feedparser.parse(content)
-    if getattr(parsed, "bozo", 0):
-        raise HTTPException(status_code=400, detail=f"Failed to parse feed: {getattr(parsed, 'bozo_exception', 'Unknown')}")
+        logger.info(f"Importing Transistor feed: {feed_url}")
+        # Fetch with headers to avoid 403/HTML responses
+        content = _fetch_feed_content(feed_url)
+        parsed = feedparser.parse(content)
+        if getattr(parsed, "bozo", 0):
+            detail = str(getattr(parsed, "bozo_exception", "Unknown"))
+            logger.error(f"Feed parse error: {detail}")
+            raise HTTPException(status_code=400, detail=f"Failed to parse feed: {detail}")
 
-    created = 0
-    updated = 0
-    for entry in parsed.entries:
-        title = entry.get("title", "Untitled")
-        link = entry.get("link")
-        guid = entry.get("id") or entry.get("guid") or link or title
-        slug = _slugify(guid)[:80]
-        if not slug:
-            slug = _slugify(title)[:80]
-        # Find audio enclosure
-        audio_url = None
-        for en in entry.get("enclosures", []) or []:
-            if en.get("type", "").startswith("audio"):
-                audio_url = en.get("href") or en.get("url")
-                break
-        if not audio_url:
-            # Some feeds use links in the summary
-            audio_url = entry.get("audio") or (entry.get("media_content", [{}])[0].get("url") if entry.get("media_content") else None)
-        # Published date
-        pub = None
-        if entry.get("published_parsed"):
-            try:
-                pub = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-            except Exception:
-                pub = None
-        elif entry.get("updated_parsed"):
-            try:
-                pub = datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc)
-            except Exception:
-                pub = None
-        summary = entry.get("summary") or entry.get("subtitle") or ""
-        author = entry.get("author") or (entry.get("authors", [{}])[0].get("name") if entry.get("authors") else None)
-        tags = [t.get("term") for t in (entry.get("tags") or []) if t.get("term")]
+        created = 0
+        updated = 0
+        for entry in parsed.entries:
+            title = entry.get("title", "Untitled")
+            link = entry.get("link")
+            guid = entry.get("id") or entry.get("guid") or link or title
+            slug = _slugify(guid)[:80]
+            if not slug:
+                slug = _slugify(title)[:80]
+            # Find audio enclosure
+            audio_url = None
+            for en in entry.get("enclosures", []) or []:
+                if (en.get("type") or "").startswith("audio"):
+                    audio_url = en.get("href") or en.get("url")
+                    break
+            if not audio_url:
+                # Some feeds use links in the summary or media content
+                audio_url = entry.get("audio") or (entry.get("media_content", [{}])[0].get("url") if isinstance(entry.get("media_content"), list) and entry.get("media_content") else None)
+            # Published date
+            pub = None
+            if entry.get("published_parsed"):
+                try:
+                    pub = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+                except Exception:
+                    pub = None
+            elif entry.get("updated_parsed"):
+                try:
+                    pub = datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc)
+                except Exception:
+                    pub = None
+            summary = entry.get("summary") or entry.get("subtitle") or ""
+            author = entry.get("author") or (entry.get("authors", [{}])[0].get("name") if entry.get("authors") else None)
+            tags = [t.get("term") for t in (entry.get("tags") or []) if isinstance(t, dict) and t.get("term")]
 
-        # Upsert behavior based on slug
-        existing = list(db["podcastepisode"].find({"slug": slug}))
-        payload = {
-            "title": title,
-            "slug": slug,
-            "summary": summary,
-            "audio_url": audio_url,
-            "guest_name": author,
-            "pillars": [],
-            "tags": tags,
-            "published_at": pub or datetime.now(timezone.utc),
-            "external_url": link,
-            "source": "transistor"
-        }
-        if existing:
-            db["podcastepisode"].update_one({"_id": existing[0]["_id"]}, {"$set": payload, "$setOnInsert": {"created_at": datetime.now(timezone.utc)}, "$currentDate": {"updated_at": True}})
-            updated += 1
-        else:
-            create_document("podcastepisode", payload)
-            created += 1
+            # Upsert behavior based on slug
+            existing = list(db["podcastepisode"].find({"slug": slug}))
+            payload = {
+                "title": title,
+                "slug": slug,
+                "summary": summary,
+                "audio_url": audio_url,
+                "guest_name": author,
+                "pillars": [],
+                "tags": tags,
+                "published_at": pub or datetime.now(timezone.utc),
+                "external_url": link,
+                "source": "transistor"
+            }
+            if existing:
+                db["podcastepisode"].update_one({"_id": existing[0]["_id"]}, {"$set": payload, "$setOnInsert": {"created_at": datetime.now(timezone.utc)}, "$currentDate": {"updated_at": True}})
+                updated += 1
+            else:
+                create_document("podcastepisode", payload)
+                created += 1
 
-    total = db["podcastepisode"].count_documents({}) if db else 0
-    return {"status": "ok", "created": created, "updated": updated, "total": total, "feed": feed_url}
+        total = db["podcastepisode"].count_documents({}) if db is not None else 0
+        return {"status": "ok", "created": created, "updated": updated, "total": total, "feed": feed_url}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Import failed with unexpected error")
+        raise HTTPException(status_code=500, detail=f"Import failed: {str(e)[:300]}")
 
 # Resources
 @app.get("/resources", response_model=Paginated)
@@ -244,7 +268,8 @@ def list_resources(
             {"title": {"$regex": q, "$options": "i"}},
             {"slug": {"$regex": q, "$options": "i"}},
         ]
-    items = get_documents("resource", query) if db else []
+    items = get_documents("resource", query) if db is not None else []
+    items = [_public(i) for i in items]
     return {"total": len(items), "items": items}
 
 # Tools & Templates
@@ -264,7 +289,8 @@ def list_tools(
         query["level"] = level
     if pillar:
         query["pillars"] = pillar
-    items = get_documents("tooltemplate", query) if db else []
+    items = get_documents("tooltemplate", query) if db is not None else []
+    items = [_public(i) for i in items]
     return {"total": len(items), "items": items}
 
 # Directory
@@ -294,15 +320,16 @@ def list_directory(
             {"company": {"$regex": q, "$options": "i"}},
             {"bio": {"$regex": q, "$options": "i"}},
         ]
-    items = get_documents("directoryprofile", query) if db else []
+    items = get_documents("directoryprofile", query) if db is not None else []
     # Featured first
     items.sort(key=lambda x: (not x.get("featured", False), x.get("name", "")))
+    items = [_public(i) for i in items]
     return {"total": len(items), "items": items}
 
 # Events
 @app.get("/events", response_model=Paginated)
 def list_events(upcoming: Optional[bool] = None):
-    items = get_documents("event") if db else []
+    items = get_documents("event") if db is not None else []
     # sort by date desc
     def _dt(v):
         if isinstance(v, datetime):
@@ -318,6 +345,7 @@ def list_events(upcoming: Optional[bool] = None):
             items = [e for e in items if e.get("date") and _dt(e["date"]) >= now]
         else:
             items = [e for e in items if e.get("date") and _dt(e["date"]) < now]
+    items = [_public(i) for i in items]
     return {"total": len(items), "items": items}
 
 # Seed minimal data for demo

@@ -1,48 +1,67 @@
 """
-Database Schemas
+Database Schemas for CRE8 Platform
 
-Define your MongoDB collection schemas here using Pydantic models.
-These schemas are used for data validation in your application.
-
-Each Pydantic model represents a collection in your database.
-Model name is converted to lowercase for the collection name:
-- User -> "user" collection
-- Product -> "product" collection
-- BlogPost -> "blogs" collection
+Each Pydantic model represents one MongoDB collection. Collection name is the lowercase class name.
 """
+from typing import List, Optional
+from pydantic import BaseModel, Field, HttpUrl
+from datetime import datetime
 
-from pydantic import BaseModel, Field
-from typing import Optional
+# Core models
+class Principle(BaseModel):
+    key: str = Field(..., description="Slug key, e.g., 'capital'")
+    title: str
+    description: str
+    color: Optional[str] = Field(None, description="Tailwind color hint, e.g., emerald")
+    icon: Optional[str] = Field(None, description="Lucide icon name")
 
-# Example schemas (replace with your own):
+class PodcastEpisode(BaseModel):
+    title: str
+    slug: str
+    summary: str
+    audio_url: Optional[HttpUrl] = None
+    guest_name: Optional[str] = None
+    guest_bio: Optional[str] = None
+    pillars: List[str] = []
+    tags: List[str] = []
+    published_at: Optional[datetime] = None
 
-class User(BaseModel):
-    """
-    Users collection schema
-    Collection name: "user" (lowercase of class name)
-    """
-    name: str = Field(..., description="Full name")
-    email: str = Field(..., description="Email address")
-    address: str = Field(..., description="Address")
-    age: Optional[int] = Field(None, ge=0, le=120, description="Age in years")
-    is_active: bool = Field(True, description="Whether user is active")
+class Resource(BaseModel):
+    title: str
+    slug: str
+    kind: str = Field(..., description="article|video|case-study|download")
+    url: Optional[HttpUrl] = None
+    pillars: List[str] = []
+    tags: List[str] = []
+    level: Optional[str] = Field(None, description="beginner|intermediate|advanced")
 
-class Product(BaseModel):
-    """
-    Products collection schema
-    Collection name: "product" (lowercase of class name)
-    """
-    title: str = Field(..., description="Product title")
-    description: Optional[str] = Field(None, description="Product description")
-    price: float = Field(..., ge=0, description="Price in dollars")
-    category: str = Field(..., description="Product category")
-    in_stock: bool = Field(True, description="Whether product is in stock")
+class ToolTemplate(BaseModel):
+    title: str
+    slug: str
+    category: str = Field(..., description="acquisition|financing|leasing|...")
+    format: str = Field(..., description="excel|pdf|gdoc|sheet|ppt")
+    level: Optional[str] = None
+    download_url: Optional[HttpUrl] = None
+    pillars: List[str] = []
+    tags: List[str] = []
 
-# Add your own schemas here:
-# --------------------------------------------------
+class DirectoryProfile(BaseModel):
+    name: str
+    company: Optional[str] = None
+    category: str = Field(..., description="Lender|Broker|Architect|...")
+    pillars: List[str] = []
+    location: Optional[str] = None
+    website: Optional[HttpUrl] = None
+    contact_email: Optional[str] = None
+    bio: Optional[str] = None
+    featured: bool = False
+    worked_with_cre8: bool = False
 
-# Note: The Flames database viewer will automatically:
-# 1. Read these schemas from GET /schema endpoint
-# 2. Use them for document validation when creating/editing
-# 3. Handle all database operations (CRUD) directly
-# 4. You don't need to create any database endpoints!
+class Event(BaseModel):
+    title: str
+    slug: str
+    date: Optional[datetime] = None
+    location: Optional[str] = None
+    summary: Optional[str] = None
+    rsvp_url: Optional[HttpUrl] = None
+    media_urls: List[HttpUrl] = []

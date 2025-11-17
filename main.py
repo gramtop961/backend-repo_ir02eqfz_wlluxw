@@ -13,6 +13,12 @@ try:
 except Exception:  # pragma: no cover
     feedparser = None
 
+# Use requests to fetch feeds with proper headers (some hosts block default agents)
+try:
+    import requests  # type: ignore
+except Exception:  # pragma: no cover
+    requests = None
+
 app = FastAPI(title="CRE8 API", version="0.1.0")
 
 app.add_middleware(
@@ -124,6 +130,22 @@ def _slugify(text: str) -> str:
     return text or "episode"
 
 
+def _fetch_feed_content(url: str) -> bytes:
+    if requests is None:
+        raise HTTPException(status_code=500, detail="HTTP client not available")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; CRE8Bot/1.0; +https://cre8.example)",
+        "Accept": "application/rss+xml, application/xml, text/xml, */*;q=0.8",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch feed: {str(e)[:200]}")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=f"Feed fetch failed with status {resp.status_code}")
+    return resp.content
+
+
 @app.post("/podcasts/import/transistor")
 def import_transistor(req: ImportRequest):
     if db is None:
@@ -135,7 +157,9 @@ def import_transistor(req: ImportRequest):
     default_feed = "https://feeds.transistor.fm/creconnection"
     feed_url = req.feed_url or os.getenv("TRANSISTOR_FEED_URL") or default_feed
 
-    parsed = feedparser.parse(feed_url)
+    # Fetch with headers to avoid 403/HTML responses
+    content = _fetch_feed_content(feed_url)
+    parsed = feedparser.parse(content)
     if getattr(parsed, "bozo", 0):
         raise HTTPException(status_code=400, detail=f"Failed to parse feed: {getattr(parsed, 'bozo_exception', 'Unknown')}")
 
@@ -156,7 +180,7 @@ def import_transistor(req: ImportRequest):
                 break
         if not audio_url:
             # Some feeds use links in the summary
-            audio_url = entry.get("audio") or entry.get("media_content", [{}])[0].get("url") if entry.get("media_content") else None
+            audio_url = entry.get("audio") or (entry.get("media_content", [{}])[0].get("url") if entry.get("media_content") else None)
         # Published date
         pub = None
         if entry.get("published_parsed"):
